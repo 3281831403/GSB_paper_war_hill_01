@@ -1,0 +1,137 @@
+const { exec, execSync } = require('child_process');
+const http = require('http');
+const path = require('path');
+
+const SERVER_PORT = 9091;
+const SERVER_URL = `http://localhost:${SERVER_PORT}`;
+const STARTUP_TIMEOUT = 10000;
+const POLL_INTERVAL = 200;
+
+// Issue #47 Fix A: pin the map seed in test mode so the multiplayer
+// playtest doesn't randomly produce slow-resolution maps. The seed is
+// read by server/pkg/game/session.go seedFromEnvOrTime() and by the
+// global RNG seeding in cmd/server/main.go.
+//
+// IMPORTANT: only forward the seed to the server when the test runner
+// explicitly sets PAPER_WAR_TEST_SEED. We do NOT set a default here,
+// because the full e2e suite includes tests that REQUIRE random seeds
+// (e.g. map-generation.spec.js "multiple games produce different
+// terrain maps"). Pinning the seed globally would break those tests.
+//
+// To run with a pinned seed (e.g. for multiplayer-playtest stability):
+//   PAPER_WAR_TEST_SEED=42 npx playwright test
+// To run the full suite with random seeds (default):
+//   npx playwright test
+const testSeed = process.env.PAPER_WAR_TEST_SEED || '';
+
+let serverProcess = null;
+
+function waitForServer(url, timeout) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeout;
+    const poll = () => {
+      if (Date.now() > deadline) {
+        return reject(new Error(`Server did not start within ${timeout}ms`));
+      }
+      const req = http.get(url, (res) => {
+        res.resume();
+        resolve();
+      });
+      req.on('error', () => setTimeout(poll, POLL_INTERVAL));
+    };
+    poll();
+  });
+}
+
+// Issue #47 follow-up: between consecutive `playwright test` invocations
+// (e.g. a for-loop in the shell), the previous server's SIGTERM may leave
+// port 9091 in TIME_WAIT. The next spawn hits EADDRINUSE and the test
+// times out against a missing server. waitForPortFree polls until the
+// port is free (or no server responds) before global-setup spawns a new
+// one. No-op on the first run of a fresh shell.
+function waitForPortFree(port, timeout) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeout;
+    const check = () => {
+      const req = http.get(`http://localhost:${port}/`, () => {
+        // Server still responding — wait and retry.
+        if (Date.now() > deadline) return resolve();
+        setTimeout(check, POLL_INTERVAL);
+      });
+      req.on('error', () => resolve()); // ECONNREFUSED = port free
+      req.setTimeout(500, () => {
+        req.destroy();
+        if (Date.now() > deadline) return resolve();
+        setTimeout(check, POLL_INTERVAL);
+      });
+    };
+    check();
+  });
+}
+
+// buildServer compiles the server binary from current source BEFORE launching
+// it. Without this, global-setup ran whatever stale `server/server` binary was
+// on disk — the e2e suite silently tested old code, masking real regressions
+// (e.g. the clash-movement bug and the stale map-generation terrain set).
+// Fails loudly with the compiler output if the build breaks.
+function buildServer(serverDir) {
+  try {
+    execSync('go build -o server ./cmd/server', {
+      cwd: serverDir,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 120000,
+    });
+  } catch (e) {
+    const stderr = e.stderr ? e.stderr.toString() : e.message;
+    throw new Error(`global-setup: server build failed — e2e cannot run.\n${stderr}`);
+  }
+}
+
+async function globalSetup() {
+  const serverDir = path.join(__dirname, '../../server');
+  const serverBin = path.join(serverDir, 'server');
+
+  // Wait for any stale server from a previous run to release the port.
+  // Issue #47 follow-up: prevents EADDRINUSE on the new spawn.
+  await waitForPortFree(SERVER_PORT, 3000);
+
+  // Build from current source so e2e tests the code that's actually on disk.
+  buildServer(serverDir);
+
+  // Issue #47 Fix A: pass PAPER_WAR_TEST_SEED to the server process so
+  // map generation + global RNG are deterministic — but ONLY when the
+  // test runner explicitly sets it. Without the env var, the server
+  // uses time-based seeds (random maps each match).
+  const serverEnv = { ...process.env };
+  if (testSeed) {
+    serverEnv.PAPER_WAR_TEST_SEED = testSeed;
+    console.log(`[test mode] PAPER_WAR_TEST_SEED=${testSeed}`);
+  } else {
+    console.log('[test mode] PAPER_WAR_TEST_SEED not set — random seeds');
+  }
+
+  serverProcess = exec(serverBin, { cwd: serverDir, env: serverEnv }, (err) => {
+    if (err && !err.killed) {
+      console.error('Server process error:', err.message);
+    }
+  });
+
+  serverProcess.stdout?.on('data', (d) => process.stdout.write(d));
+  serverProcess.stderr?.on('data', (d) => process.stderr.write(d));
+
+  try {
+    await waitForServer(SERVER_URL, STARTUP_TIMEOUT);
+    console.log(`Server ready at ${SERVER_URL}`);
+  } catch (e) {
+    throw new Error(`Failed to start server: ${e.message}`);
+  }
+
+  return async () => {
+    if (serverProcess) {
+      serverProcess.kill('SIGTERM');
+      serverProcess = null;
+    }
+  };
+}
+
+module.exports = globalSetup;

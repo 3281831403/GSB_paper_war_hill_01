@@ -1,0 +1,34 @@
+.superpowers/
+node_modules/
+test-results/
+server/server
+
+# Debug test files
+server/pkg/game/combat_flow_test.go
+server/pkg/game/combat_kill_test.go
+server/pkg/game/death_events_test.go
+server/pkg/game/flow_debug_test.go
+server/pkg/game/live_combat_test.go
+server/pkg/game/phase_debug_test.go
+auth-gh.sh
+do-push.sh
+
+# v1.0.0 polish pass — throwaway investigation artifacts, kept locally
+# under .scratch/ for reference but not committed.
+.scratch/_inspect.spec.js
+.scratch/_playtest-mp.spec.js
+.scratch/_playtest-solo.spec.js
+.scratch/far_spawn_test.go
+.scratch/far_spawn_test.go.disabled
+.scratch/v1-polish-pass-2026-06-28.md
+.scratch/_smoke-career.spec.js
+.scratch/_smoke-leaderboard.spec.js
+
+# v1.1 plans are working docs, not source.
+.heres/plans/
+.hermes/plans/
+.gstack/
+
+# CodeGraph local index (tool artifact)
+.codegraph/
+server/server.log

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Paper War — Animation Editor</title>
+  <style>
+    /* Dev tool only — deliberately NOT using the ui-ux-pro-max design
+       system (ADR-0021). Plain dark UI, minimal CSS. */
+    :root {
+      --bg: #1a1a1a;
+      --panel: #2a2a2a;
+      --border: #444;
+      --text: #e0e0e0;
+      --muted: #888;
+      --accent: #c8a832; /* gold, matches in-game accent for familiarity */
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+      padding: 12px;
+    }
+    h1 { font-size: 16px; margin: 0 0 8px; }
+    h2 { font-size: 13px; margin: 16px 0 6px; color: var(--muted);
+         text-transform: uppercase; letter-spacing: 0.05em; }
+    .row {
+      display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+      margin-bottom: 6px;
+    }
+    .row label { color: var(--muted); margin-right: 4px; min-width: 70px; }
+    button {
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 4px 10px; cursor: pointer; font: inherit;
+    }
+    button:hover { border-color: var(--accent); }
+    button.active {
+      background: var(--accent); color: #1a1a1a; border-color: var(--accent);
+      font-weight: 600;
+    }
+    input[type="number"] {
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 3px 6px; font: inherit; width: 60px;
+    }
+    .canvas-wrap {
+      background: #111;
+      background-image:
+        linear-gradient(45deg, #1f1f1f 25%, transparent 25%),
+        linear-gradient(-45deg, #1f1f1f 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #1f1f1f 75%),
+        linear-gradient(-45deg, transparent 75%, #1f1f1f 75%);
+      background-size: 16px 16px;
+      background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 12px; display: inline-block;
+    }
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges;
+             display: block; }
+    .preview { width: 128px; height: 128px; }
+    .grid-cell { width: 32px; height: 32px; }
+    .grid-row { display: flex; gap: 2px; margin-bottom: 2px; }
+    .grid-label { color: var(--muted); width: 16px; font-size: 11px;
+                  line-height: 32px; }
+    .scrub-strip { display: flex; gap: 4px; }
+    .scrub-strip canvas { width: 48px; height: 48px; cursor: pointer;
+                           border: 2px solid transparent; }
+    .scrub-strip canvas.selected { border-color: var(--accent); }
+    .info { color: var(--muted); font-size: 12px; }
+    code { background: var(--panel); padding: 1px 4px; border-radius: 2px;
+           color: var(--accent); }
+    .tune-table { border-collapse: collapse; margin-bottom: 8px; }
+    .tune-table th, .tune-table td { padding: 2px 6px; text-align: left; }
+    .tune-table th { color: var(--muted); font-weight: 600;
+                     font-size: 11px; text-transform: uppercase;
+                     letter-spacing: 0.05em; }
+    .tune-table td:first-child { color: var(--muted); }
+    .tune-input {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 2px 4px; font: inherit; width: 50px;
+    }
+    .tune-input:focus { border-color: var(--accent); outline: none; }
+    .columns { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+    .col { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 4px; padding: 10px; }
+    .atlas-wrap { overflow: auto; max-width: 100%; }
+    textarea {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 3px;
+      padding: 4px 6px; font: inherit; resize: vertical;
+    }
+    textarea:focus { border-color: var(--accent); outline: none; }
+    label.ai-lbl { color: var(--muted); min-width: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Paper War — Animation Editor</h1>
+  <p class="info">
+    Dev tool for browsing and tuning combat-unit animations. Read-only against
+    sprite code — tunes parameters only. See issue #50. Served by the Go
+    <code>http.FileServer</code>; no build step.
+  </p>
+
+  <div class="row" id="unit-row"></div>
+  <div class="row" id="state-row"></div>
+
+  <div class="col" style="margin-bottom:8px">
+    <h2>AI timing assistant — GLM</h2>
+    <div class="info" style="margin-bottom:6px">
+      Describe an animation-timing change in plain language; the linked GLM model
+      returns a JSON delta over <code>FRAMES_PER_STATE</code> /
+      <code>ANIM_FPS</code> that merges into the table and re-renders live.
+      Key from <code>GLM_API_KEY</code> env on the server, or enter one below
+      (shared with the combat-unit editor; stored only in this browser's
+      localStorage).
+    </div>
+    <div class="row">
+      <label class="ai-lbl">Backend</label>
+      <select id="ai-backend" class="tune-input" style="width:140px">
+        <option value="claude">Claude CLI</option>
+        <option value="glm">GLM (HTTP)</option>
+      </select>
+      <label class="ai-lbl">API key</label>
+      <input type="password" id="ai-key" class="tune-input" style="width:200px" placeholder="glm-… (or set GLM_API_KEY env)" />
+      <label class="ai-lbl">Base URL</label>
+      <input type="text" id="ai-base" class="tune-input" style="width:240px" />
+      <label class="ai-lbl">Model</label>
+      <input type="text" id="ai-model" class="tune-input" style="width:110px" />
+    </div>
+    <div class="row" style="align-items:flex-start">
+      <label class="ai-lbl">Prompt</label>
+      <textarea id="ai-prompt" rows="2" style="flex:1;min-width:300px;max-width:760px"
+        placeholder="e.g. Make the attack animation snappier: 4 frames at 18 fps."></textarea>
+    </div>
+    <div class="row">
+      <button id="ai-apply-btn" class="active">Ask GLM &amp; apply</button>
+      <button id="ai-quick-1">Snappier attack</button>
+      <button id="ai-quick-2">Livelier idle</button>
+      <button id="ai-quick-3">Faster movement</button>
+      <span class="info" id="ai-status" style="margin-left:8px"></span>
+    </div>
+  </div>
+  <div class="row" id="dir-row"></div>
+  <div class="row">
+    <label>FPS override</label>
+    <input type="number" id="fps-input" min="1" max="30" value="14" />
+    <button id="play-btn" class="active">▶ Play</button>
+    <button id="prev-btn">⏮</button>
+    <button id="next-btn">⏭</button>
+    <label style="display:inline-flex;align-items:center;gap:4px;color:var(--muted);margin-left:8px;min-width:auto;cursor:pointer">
+      <input type="checkbox" id="collision-toggle" /> collision radius
+    </label>
+    <span class="info" id="frame-info" style="margin-left:8px"></span>
+  </div>
+
+  <div class="columns">
+    <div class="col">
+      <h2>Preview (4×)</h2>
+      <div class="canvas-wrap">
+        <canvas class="preview" id="preview" width="32" height="32"></canvas>
+      </div>
+      <h2>Scrub strip</h2>
+      <div class="scrub-strip" id="scrub-strip"></div>
+    </div>
+
+    <div class="col">
+      <h2>Grid — all dirs × frames (current unit + state)</h2>
+      <div id="grid-view"></div>
+    </div>
+
+    <div class="col">
+      <h2>Constants (editable)</h2>
+      <div id="constants"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="copy-btn">Copy constants to clipboard</button>
+        <button id="reset-btn">Reset to source</button>
+      </div>
+      <div class="info" id="copy-status" style="margin-top:6px"></div>
+    </div>
+  </div>
+
+  <h2>Full atlas (every unit × state × dir × frame)</h2>
+  <div class="atlas-wrap">
+    <div class="canvas-wrap">
+      <canvas id="atlas" width="1024" height="576"
+              style="width: 1024px; height: 576px;"></canvas>
+    </div>
+  </div>
+
+  <script type="module" src="animation_editor.js"></script>
+</body>
+</html>

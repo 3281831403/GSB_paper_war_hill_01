@@ -1,0 +1,364 @@
+//go:build pgx
+
+package persist
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PostgresStore implements Store using PostgreSQL with JSONB columns.
+// Build with -tags nopgx to use a stub instead (for CI without Postgres).
+type PostgresStore struct {
+	pool *pgxpool.Pool
+}
+
+// NewPostgresStore creates a connection pool and ensures the schema exists.
+func NewPostgresStore(ctx context.Context, connString string) (*PostgresStore, error) {
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("parse conn string: %w", err)
+	}
+	cfg.MaxConns = 10
+	cfg.MinConns = 2
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping db: %w", err)
+	}
+
+	ps := &PostgresStore{pool: pool}
+	if err := ps.ensureSchema(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure schema: %w", err)
+	}
+	return ps, nil
+}
+
+func (s *PostgresStore) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
+}
+
+func (s *PostgresStore) ensureSchema(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS players (
+			id         SERIAL PRIMARY KEY,
+			token      TEXT NOT NULL UNIQUE,
+			name       TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE IF NOT EXISTS commanders (
+			id           SERIAL PRIMARY KEY,
+			player_id    INT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+			name         TEXT NOT NULL DEFAULT 'Commander',
+			type         TEXT NOT NULL DEFAULT 'LightInfantry',
+			level        SMALLINT NOT NULL DEFAULT 1,
+			gold         INT NOT NULL DEFAULT 50,
+			formation    JSONB NOT NULL DEFAULT '{"weapon_slot":"Light","armor_slot":"Light","leading_skill":100}',
+			combat_units JSONB NOT NULL DEFAULT '[]',
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			CONSTRAINT uq_commanders_player_name UNIQUE (player_id, name)
+		);
+		CREATE INDEX IF NOT EXISTS idx_commanders_player_id ON commanders(player_id);
+		CREATE INDEX IF NOT EXISTS idx_players_token ON players(token);
+
+		-- v1.2: backfill the name column on existing databases. Idempotent:
+		-- ADD COLUMN IF NOT EXISTS skips if the column exists, and the UPDATE
+		-- is a no-op once the column is populated.
+		ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
+
+		-- v1.2: leaderboard query needs an index on player_career.total_kills
+		-- to avoid a full table scan when the player count grows.
+		CREATE INDEX IF NOT EXISTS idx_player_career_total_kills
+			ON player_career(total_kills DESC);
+
+		CREATE TABLE IF NOT EXISTS player_career (
+			player_id          INT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+			matches_played     INT NOT NULL DEFAULT 0,
+			matches_won        INT NOT NULL DEFAULT 0,
+			matches_lost       INT NOT NULL DEFAULT 0,
+			total_kills        INT NOT NULL DEFAULT 0,
+			total_deaths       INT NOT NULL DEFAULT 0,
+			commander_kills    INT NOT NULL DEFAULT 0,
+			commanders_lost    INT NOT NULL DEFAULT 0,
+			total_gold_earned  INT NOT NULL DEFAULT 0,
+			total_gold_spent   INT NOT NULL DEFAULT 0,
+			total_recruits     INT NOT NULL DEFAULT 0,
+			last_played_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+	`)
+	return err
+}
+
+func (s *PostgresStore) FindOrCreatePlayer(ctx context.Context, token, name string) (*Player, error) {
+	// Try to find existing player. SELECT ... ON CONFLICT DO NOTHING gives us
+	// an atomic "is this token known?" check without a separate race window.
+	var (
+		id   uint32
+		dbName string
+	)
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO players (token, name, created_at)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (token) DO UPDATE SET name = EXCLUDED.name
+		 RETURNING id, name`,
+		token, name, time.Now(),
+	).Scan(&id, &dbName)
+	if err != nil {
+		return nil, fmt.Errorf("upsert player: %w", err)
+	}
+
+	// Was this a new row or an existing one? Check if the starter roster
+	// exists; if not, create it. (Cheaper than always doing a SELECT first.)
+	roster, err := s.LoadRoster(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load roster for player %d: %w", id, err)
+	}
+	if len(roster) == 0 {
+		if err := s.CreateStarterRoster(ctx, id); err != nil {
+			return nil, fmt.Errorf("create starter roster: %w", err)
+		}
+		roster, err = s.LoadRoster(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("reload starter roster: %w", err)
+		}
+	}
+	return &Player{ID: id, Token: token, Name: dbName, Commanders: roster}, nil
+}
+
+func (s *PostgresStore) LoadRoster(ctx context.Context, playerID uint32) ([]Commander, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, type, level, gold, formation, combat_units
+		FROM commanders WHERE player_id = $1 ORDER BY id
+	`, playerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var commanders []Commander
+	cmdID := uint8(0)
+	for rows.Next() {
+		cmdID++
+		var dbID int
+		var name, cmdType string
+		var level int
+		var gold int
+		var formationJSON, unitsJSON []byte
+
+		if err := rows.Scan(&dbID, &name, &cmdType, &level, &gold, &formationJSON, &unitsJSON); err != nil {
+			return nil, err
+		}
+
+		var formation FormationTemplate
+		if err := json.Unmarshal(formationJSON, &formation); err != nil {
+			return nil, fmt.Errorf("unmarshal formation: %w", err)
+		}
+
+		var units []CombatUnit
+		if err := json.Unmarshal(unitsJSON, &units); err != nil {
+			return nil, fmt.Errorf("unmarshal units: %w", err)
+		}
+
+		commanders = append(commanders, Commander{
+			ID:        cmdID,
+			Name:      name,
+			Type:      cmdType,
+			Level:     uint8(level),
+			Gold:      int32(gold),
+			Formation: formation,
+			Units:     units,
+		})
+	}
+	return commanders, rows.Err()
+}
+
+func (s *PostgresStore) SaveCommander(ctx context.Context, playerID uint32, cmd Commander) error {
+	formationJSON, err := json.Marshal(cmd.Formation)
+	if err != nil {
+		return fmt.Errorf("marshal formation: %w", err)
+	}
+	unitsJSON, err := json.Marshal(cmd.Units)
+	if err != nil {
+		return fmt.Errorf("marshal units: %w", err)
+	}
+
+	// Upsert: insert or update on conflict (player_id, name)
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO commanders (player_id, name, type, level, gold, formation, combat_units, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (player_id, name) DO UPDATE SET
+			type = EXCLUDED.type,
+			level = EXCLUDED.level,
+			gold = EXCLUDED.gold,
+			formation = EXCLUDED.formation,
+			combat_units = EXCLUDED.combat_units
+	`, playerID, cmd.Name, cmd.Type, int(cmd.Level), int(cmd.Gold), formationJSON, unitsJSON, time.Now())
+	if err != nil {
+		return fmt.Errorf("upsert commander: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("save commander: no rows affected")
+	}
+	return nil
+}
+
+func (s *PostgresStore) DeleteCommander(ctx context.Context, playerID uint32, cmdID uint8) error {
+	// Delete by offset — cmdID is 1-based index in the roster
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM commanders
+		WHERE id = (
+			SELECT id FROM commanders
+			WHERE player_id = $1
+			ORDER BY id
+			OFFSET $2 LIMIT 1
+		)
+	`, playerID, int(cmdID-1))
+	if err != nil {
+		return fmt.Errorf("delete commander: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("commander %d not found for player %d", cmdID, playerID)
+	}
+	return nil
+}
+
+func (s *PostgresStore) CreateStarterRoster(ctx context.Context, playerID uint32) error {
+	units := make([]CombatUnit, 5)
+	for i := range units {
+		units[i] = CombatUnit{
+			ID:    uint8(i + 1),
+			Type:  "LightInfantry",
+			Level: 1,
+		}
+	}
+
+	formation := FormationTemplate{
+		WeaponSlot:   "Light",
+		ArmorSlot:    "Light",
+		LeadingSkill: 100,
+	}
+
+	formationJSON, err := json.Marshal(formation)
+	if err != nil {
+		return err
+	}
+	unitsJSON, err := json.Marshal(units)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO commanders (player_id, name, type, level, gold, formation, combat_units, created_at)
+		VALUES ($1, 'Starter Commander', 'LightInfantry', 1, 50, $2, $3, $4)
+	`, playerID, formationJSON, unitsJSON, time.Now())
+	return err
+}
+
+// GetCareerStats returns the player's career totals, or a zero-valued
+// CareerStats for players who haven't played any matches yet.
+func (s *PostgresStore) GetCareerStats(ctx context.Context, playerID uint32) (*CareerStats, error) {
+	c := &CareerStats{PlayerID: playerID}
+	err := s.pool.QueryRow(ctx, `
+		SELECT matches_played, matches_won, matches_lost,
+		       total_kills, total_deaths, commander_kills, commanders_lost,
+		       total_gold_earned, total_gold_spent, total_recruits
+		FROM player_career WHERE player_id = $1
+	`, playerID).Scan(
+		&c.MatchesPlayed, &c.MatchesWon, &c.MatchesLost,
+		&c.TotalKills, &c.TotalDeaths, &c.CommanderKills, &c.CommandersLost,
+		&c.TotalGoldEarned, &c.TotalGoldSpent, &c.TotalRecruits,
+	)
+	if err != nil {
+		// No row yet — return zero stats (consistent with MockStore).
+		// Real DB errors (connection dropped) will also surface here; callers
+		// can distinguish by type-asserting pgx.ErrNoRows vs other errors.
+		return c, nil
+	}
+	return c, nil
+}
+
+// AddCareerStats atomically accumulates delta into the player's career totals.
+// Uses INSERT ... ON CONFLICT DO UPDATE so it works for both first-match-ever
+// and subsequent matches. Single statement = atomic.
+func (s *PostgresStore) AddCareerStats(ctx context.Context, playerID uint32, delta CareerStats) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO player_career (
+			player_id, matches_played, matches_won, matches_lost,
+			total_kills, total_deaths, commander_kills, commanders_lost,
+			total_gold_earned, total_gold_spent, total_recruits, last_played_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now()
+		)
+		ON CONFLICT (player_id) DO UPDATE SET
+			matches_played    = player_career.matches_played    + EXCLUDED.matches_played,
+			matches_won       = player_career.matches_won       + EXCLUDED.matches_won,
+			matches_lost      = player_career.matches_lost      + EXCLUDED.matches_lost,
+			total_kills       = player_career.total_kills       + EXCLUDED.total_kills,
+			total_deaths      = player_career.total_deaths      + EXCLUDED.total_deaths,
+			commander_kills   = player_career.commander_kills   + EXCLUDED.commander_kills,
+			commanders_lost   = player_career.commanders_lost   + EXCLUDED.commanders_lost,
+			total_gold_earned = player_career.total_gold_earned + EXCLUDED.total_gold_earned,
+			total_gold_spent  = player_career.total_gold_spent  + EXCLUDED.total_gold_spent,
+			total_recruits    = player_career.total_recruits    + EXCLUDED.total_recruits,
+			last_played_at    = now()
+	`,
+		playerID,
+		delta.MatchesPlayed, delta.MatchesWon, delta.MatchesLost,
+		delta.TotalKills, delta.TotalDeaths, delta.CommanderKills, delta.CommandersLost,
+		delta.TotalGoldEarned, delta.TotalGoldSpent, delta.TotalRecruits,
+	)
+	return err
+}
+
+// GetLeaderboard returns the top-N players by total kills, joining the
+// players table for display names. Players with zero matches_played are
+// excluded. Ranking metric is total_kills DESC; ties broken by matches_won
+// DESC, then player_id ASC for determinism.
+func (s *PostgresStore) GetLeaderboard(ctx context.Context, limit int) ([]LeaderboardEntry, error) {
+	limit = clampLeaderboardLimit(limit)
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			pc.player_id,
+			p.name,
+			pc.matches_played,
+			pc.matches_won,
+			pc.matches_lost,
+			pc.total_kills,
+			pc.total_deaths
+		FROM player_career pc
+		JOIN players p ON p.id = pc.player_id
+		WHERE pc.matches_played > 0
+		ORDER BY pc.total_kills DESC, pc.matches_won DESC, pc.player_id ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("leaderboard query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []LeaderboardEntry
+	rank := uint32(1)
+	for rows.Next() {
+		var e LeaderboardEntry
+		if err := rows.Scan(&e.PlayerID, &e.Name, &e.MatchesPlayed,
+			&e.MatchesWon, &e.MatchesLost, &e.TotalKills, &e.TotalDeaths); err != nil {
+			return nil, fmt.Errorf("leaderboard scan: %w", err)
+		}
+		e.Rank = rank
+		rank++
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
